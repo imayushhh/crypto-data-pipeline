@@ -1,6 +1,6 @@
 # Crypto Data Pipeline
 
-This repository runs a daily crypto data pipeline from GitHub Actions.
+This repository runs a daily crypto data pipeline from GitHub Actions that feeds a Power BI report.
 
 ## What it does
 
@@ -12,6 +12,11 @@ The pipeline:
 4. Pulls order book data from Binance.
 5. Pulls derivatives data from Binance Futures.
 6. Pulls 24hr ticker data from Binance.
+
+## Power BI Report
+
+The dashboard is built in Power BI Desktop using the tables populated by this pipeline.
+Link to the report:
 
 ## Local setup
 
@@ -53,4 +58,4 @@ Before the workflow can run, add a repository secret named `DATABASE_URL` with y
 - `pipeline.py` for the daily job
 - `.github/workflows/crypto_pipeline.yml` for scheduling
 - `requirements.txt` for dependencies
-- The image assets and `Airflow_project.pbix` report
+
