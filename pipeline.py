@@ -169,7 +169,7 @@ def run_crypto_data():
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """, rows)
         conn.commit()
-        print("✔ crypto_data inserted successfully")
+        print(f"✔ crypto_data inserted successfully ({len(rows)} rows)")
     finally:
         if cursor is not None:
             cursor.close()
@@ -241,7 +241,7 @@ def run_order_book():
             """, rows)
 
         conn.commit()
-        print("✔ orderbook inserted successfully")
+        print(f"✔ orderbook inserted successfully ({len(rows)} rows)")
     finally:
         if cursor is not None:
             cursor.close()
@@ -309,7 +309,7 @@ def run_derivatives_data():
             """, rows)
 
         conn.commit()
-        print("✔ derivatives_data inserted successfully")
+        print(f"✔ derivatives_data inserted successfully ({len(rows)} rows)")
     finally:
         if cursor is not None:
             cursor.close()
@@ -410,7 +410,7 @@ def run_ticker_data():
             """, rows)
 
         conn.commit()
-        print("✔ crypto_24market_data inserted successfully")
+        print(f"✔ crypto_24market_data inserted successfully ({len(rows)} rows)")
     finally:
         if cursor is not None:
             cursor.close()
@@ -418,15 +418,32 @@ def run_ticker_data():
             conn.close()
 
 
+def run_step(step_name, step_function):
+    try:
+        print(f"Running {step_name}...")
+        step_function()
+        return True
+    except Exception as exc:
+        print(f"✖ {step_name} failed: {exc}")
+        return False
+
+
 def main():
     print("Starting pipeline...")
     setup_tables()
     cleanup_old_data()
-    run_crypto_data()
-    run_order_book()
-    run_derivatives_data()
-    run_ticker_data()
-    print("✔ Pipeline completed successfully.")
+
+    results = [
+        run_step("crypto_data", run_crypto_data),
+        run_step("orderbook", run_order_book),
+        run_step("derivatives_data", run_derivatives_data),
+        run_step("crypto_24market_data", run_ticker_data),
+    ]
+
+    if all(results):
+        print("✔ Pipeline completed successfully.")
+    else:
+        print("⚠ Pipeline completed with one or more failed stages.")
 
 
 if __name__ == "__main__":
