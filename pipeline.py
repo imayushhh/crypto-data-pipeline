@@ -3,6 +3,10 @@ from datetime import datetime
 
 DB_URL = os.environ["DATABASE_URL"]
 
+# Binance blocks GitHub Actions IPs — using api.binance.vision (Binance's own CDN mirror)
+# and a browser User-Agent as a fallback to avoid IP blocking
+BINANCE_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
 
 def setup_tables():
     conn = None
@@ -71,6 +75,10 @@ def setup_tables():
         """)
 
         conn.commit()
+        print("✔ Tables set up successfully.")
+    except Exception as e:
+        print(f"✖ setup_tables failed: {e}")
+        raise  # stop everything if tables can't be created
     finally:
         if cursor is not None:
             cursor.close()
@@ -81,33 +89,23 @@ def setup_tables():
 def cleanup_old_data():
     conn = None
     cursor = None
-    crypto_deleted = 0
-    orderbook_deleted = 0
-    derivatives_deleted = 0
-    market_deleted = 0
-
     try:
         conn = psycopg2.connect(DB_URL)
         cursor = conn.cursor()
 
         cursor.execute("DELETE FROM crypto_data WHERE date < CURRENT_DATE - INTERVAL '30 days'")
-        crypto_deleted = cursor.rowcount
+        print(f"Deleted {cursor.rowcount} rows from crypto_data")
 
         cursor.execute("DELETE FROM orderbook WHERE date < CURRENT_DATE - INTERVAL '30 days'")
-        orderbook_deleted = cursor.rowcount
+        print(f"Deleted {cursor.rowcount} rows from orderbook")
 
         cursor.execute("DELETE FROM derivatives_data WHERE date_time < NOW() - INTERVAL '30 days'")
-        derivatives_deleted = cursor.rowcount
+        print(f"Deleted {cursor.rowcount} rows from derivatives_data")
 
         cursor.execute("DELETE FROM crypto_24market_data WHERE date < CURRENT_DATE - INTERVAL '30 days'")
-        market_deleted = cursor.rowcount
+        print(f"Deleted {cursor.rowcount} rows from crypto_24market_data")
 
         conn.commit()
-
-        print(f"Deleted {crypto_deleted} rows from crypto_data")
-        print(f"Deleted {orderbook_deleted} rows from orderbook")
-        print(f"Deleted {derivatives_deleted} rows from derivatives_data")
-        print(f"Deleted {market_deleted} rows from crypto_24market_data")
     finally:
         if cursor is not None:
             cursor.close()
@@ -118,45 +116,40 @@ def cleanup_old_data():
 def run_crypto_data():
     conn = None
     cursor = None
-
     try:
         url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&sparkline=false"
-        response = requests.get(url)
+        response = requests.get(url, timeout=30)
         response.raise_for_status()
         data = response.json()
 
         df = pd.DataFrame(data)
         df = df.reindex(columns=[
-            "name",
-            "current_price",
-            "market_cap",
-            "total_volume",
-            "price_change_percentage_24h",
-            "circulating_supply",
-            "total_supply",
+            "name", "current_price", "market_cap", "total_volume",
+            "price_change_percentage_24h", "circulating_supply", "total_supply",
         ])
 
+        # Save total_supply before fillna so we can preserve None vs 0
         total_supply_values = df["total_supply"].copy()
         df = df.fillna(0)
         df["date"] = datetime.now().date()
 
         rows = []
-        for index, row in df.iterrows():
-            total_supply = total_supply_values.iloc[index]
-            if total_supply == "" or total_supply is None or pd.isna(total_supply):
+        for i, row in enumerate(df.itertuples(index=False, name=None)):
+            raw_ts = total_supply_values.iloc[i]
+            if raw_ts is None or raw_ts == "" or (isinstance(raw_ts, float) and pd.isna(raw_ts)):
                 total_supply = None
             else:
-                total_supply = float(total_supply)
+                total_supply = float(raw_ts)
 
             rows.append((
-                row["name"],
-                row["current_price"],
-                row["market_cap"],
-                row["total_volume"],
-                row["price_change_percentage_24h"],
-                row["circulating_supply"],
-                total_supply,
-                row["date"],
+                row[0],   # name
+                float(row[1]),  # current_price
+                float(row[2]),  # market_cap
+                float(row[3]),  # total_volume
+                float(row[4]),  # price_change_percentage_24h
+                float(row[5]),  # circulating_supply
+                total_supply,   # total_supply (None or float)
+                row[7],         # date
             ))
 
         conn = psycopg2.connect(DB_URL)
@@ -168,8 +161,10 @@ def run_crypto_data():
                  circulating_supply, total_supply, date)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """, rows)
-        conn.commit()
-        print(f"✔ crypto_data inserted successfully ({len(rows)} rows)")
+            conn.commit()
+            print(f"✔ crypto_data inserted successfully ({len(rows)} rows)")
+        else:
+            print("⚠ crypto_data: no rows to insert")
     finally:
         if cursor is not None:
             cursor.close()
@@ -188,14 +183,14 @@ def run_order_book():
         "Algorand": "ALGOUSDT", "ApeCoin": "APEUSDT"
     }
 
-    all_data = []
+    rows = []
 
     for coin_name, symbol in coins.items():
         try:
-            url = f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=5"
-            response = requests.get(url)
+            url = f"https://api.binance.vision/api/v3/depth?symbol={symbol}&limit=5"
+            response = requests.get(url, timeout=30, headers=BINANCE_HEADERS)
             if response.status_code != 200:
-                print(f"Error fetching {coin_name}: {response.status_code}")
+                print(f"Error fetching orderbook {coin_name}: {response.status_code}")
                 continue
 
             order_book = response.json()
@@ -203,45 +198,34 @@ def run_order_book():
             asks = order_book.get("asks", [])
 
             for i in range(min(len(bids), len(asks), 5)):
-                all_data.append({
-                    "coin": coin_name,
-                    "level": i + 1,
-                    "bid_price": float(bids[i][0]),
-                    "bid_quantity": float(bids[i][1]),
-                    "ask_price": float(asks[i][0]),
-                    "ask_quantity": float(asks[i][1]),
-                    "date": pd.Timestamp.now().date(),
-                })
+                rows.append((
+                    coin_name,
+                    i + 1,
+                    float(bids[i][0]),
+                    float(bids[i][1]),
+                    float(asks[i][0]),
+                    float(asks[i][1]),
+                    pd.Timestamp.now().date(),
+                ))
         except Exception as e:
-            print(f"Exception for {coin_name}: {e}")
+            print(f"Exception for orderbook {coin_name}: {e}")
             continue
-
-    df = pd.DataFrame(all_data, columns=[
-        "coin",
-        "level",
-        "bid_price",
-        "bid_quantity",
-        "ask_price",
-        "ask_quantity",
-        "date",
-    ])
 
     conn = None
     cursor = None
     try:
         conn = psycopg2.connect(DB_URL)
         cursor = conn.cursor()
-
-        rows = list(df.itertuples(index=False, name=None))
         if rows:
             cursor.executemany("""
                 INSERT INTO orderbook
                 (coin, level, bid_price, bid_quantity, ask_price, ask_quantity, date)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, rows)
-
-        conn.commit()
-        print(f"✔ orderbook inserted successfully ({len(rows)} rows)")
+            conn.commit()
+            print(f"✔ orderbook inserted successfully ({len(rows)} rows)")
+        else:
+            print("⚠ orderbook: no rows to insert")
     finally:
         if cursor is not None:
             cursor.close()
@@ -260,56 +244,46 @@ def run_derivatives_data():
         "Algorand": "ALGOUSDT", "ApeCoin": "APEUSDT"
     }
 
-    data = []
+    rows = []
 
     for coin_name, symbol in coins.items():
         url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}"
         try:
-            response = requests.get(url)
+            response = requests.get(url, timeout=30, headers=BINANCE_HEADERS)
             if response.status_code == 200:
-                coin_data = response.json()
-                data.append({
-                    "coin": coin_name,
-                    "mark_price": coin_data.get("markPrice"),
-                    "estimated_settle_price": coin_data.get("estimatedSettlePrice"),
-                    "index_price": coin_data.get("indexPrice"),
-                    "funding_rate": coin_data.get("lastFundingRate"),
-                    "interest_rate": coin_data.get("interestRate"),
-                    "date_time": pd.Timestamp.now(),
-                })
+                d = response.json()
+                # FIX: Binance returns all values as strings — must cast to float
+                rows.append((
+                    coin_name,
+                    float(d.get("markPrice") or 0),
+                    float(d.get("estimatedSettlePrice") or 0),
+                    float(d.get("indexPrice") or 0),
+                    float(d.get("lastFundingRate") or 0),
+                    float(d.get("interestRate") or 0),
+                    datetime.now(),
+                ))
             else:
-                print(f"Failed to fetch data for {coin_name} ({symbol}) - Status code {response.status_code}")
+                print(f"Failed to fetch derivatives {coin_name} ({symbol}) - Status {response.status_code}")
         except Exception as e:
-            print(f"Exception fetching {coin_name}: {e}")
+            print(f"Exception fetching derivatives {coin_name}: {e}")
 
         time.sleep(0.2)
-
-    df = pd.DataFrame(data, columns=[
-        "coin",
-        "mark_price",
-        "estimated_settle_price",
-        "index_price",
-        "funding_rate",
-        "interest_rate",
-        "date_time",
-    ])
 
     conn = None
     cursor = None
     try:
         conn = psycopg2.connect(DB_URL)
         cursor = conn.cursor()
-
-        rows = list(df.itertuples(index=False, name=None))
         if rows:
             cursor.executemany("""
                 INSERT INTO derivatives_data
                 (coin, mark_price, estimated_settle_price, index_price, funding_rate, interest_rate, date_time)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, rows)
-
-        conn.commit()
-        print(f"✔ derivatives_data inserted successfully ({len(rows)} rows)")
+            conn.commit()
+            print(f"✔ derivatives_data inserted successfully ({len(rows)} rows)")
+        else:
+            print("⚠ derivatives_data: no rows to insert")
     finally:
         if cursor is not None:
             cursor.close()
@@ -328,79 +302,40 @@ def run_ticker_data():
         "Algorand": "ALGOUSDT", "ApeCoin": "APEUSDT"
     }
 
-    all_data = []
+    rows = []
 
     for coin_name, symbol in coins.items():
-        url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
+        url = f"https://api.binance.vision/api/v3/ticker/24hr?symbol={symbol}"
         try:
-            response = requests.get(url)
+            response = requests.get(url, timeout=30, headers=BINANCE_HEADERS)
             if response.status_code == 200:
-                data = response.json()
-                data["Coin"] = coin_name
-                all_data.append(data)
+                d = response.json()
+                # FIX: Binance returns price values as strings — cast explicitly
+                rows.append((
+                    coin_name,
+                    str(d.get("symbol", symbol)),
+                    float(d.get("priceChangePercent") or 0),
+                    float(d.get("lastPrice") or 0),
+                    float(d.get("volume") or 0),
+                    float(d.get("openPrice") or 0),
+                    float(d.get("highPrice") or 0),
+                    float(d.get("lowPrice") or 0),
+                    float(d.get("quoteVolume") or 0),
+                    int(d.get("count") or 0),
+                    float(d.get("bidPrice") or 0),
+                    float(d.get("askPrice") or 0),
+                    pd.Timestamp.now().date(),
+                ))
             else:
-                print(f"Error fetching {symbol}")
+                print(f"Error fetching ticker {symbol}: {response.status_code}")
         except Exception as e:
-            print(f"Exception fetching {coin_name}: {e}")
-
-    df = pd.DataFrame(all_data)
-    df = df.reindex(columns=[
-        "Coin",
-        "symbol",
-        "priceChangePercent",
-        "lastPrice",
-        "volume",
-        "openPrice",
-        "highPrice",
-        "lowPrice",
-        "quoteVolume",
-        "count",
-        "bidPrice",
-        "askPrice",
-    ])
-
-    df.fillna(0, inplace=True)
-
-    price_volume_cols = [
-        "priceChangePercent",
-        "lastPrice",
-        "volume",
-        "openPrice",
-        "highPrice",
-        "lowPrice",
-        "quoteVolume",
-        "bidPrice",
-        "askPrice",
-    ]
-    for col in price_volume_cols:
-        df[col] = df[col].astype(float)
-
-    df["count"] = df["count"].astype(float)
-    df.rename(columns={"count": "trade_count"}, inplace=True)
-    df["date"] = pd.Timestamp.now().date()
+            print(f"Exception fetching ticker {coin_name}: {e}")
 
     conn = None
     cursor = None
     try:
         conn = psycopg2.connect(DB_URL)
         cursor = conn.cursor()
-
-        rows = [(
-            row["Coin"],
-            row["symbol"],
-            row["priceChangePercent"],
-            row["lastPrice"],
-            row["volume"],
-            row["openPrice"],
-            row["highPrice"],
-            row["lowPrice"],
-            row["quoteVolume"],
-            int(row["trade_count"]),
-            row["bidPrice"],
-            row["askPrice"],
-            row["date"],
-        ) for _, row in df.iterrows()]
-
         if rows:
             cursor.executemany("""
                 INSERT INTO crypto_24market_data
@@ -408,9 +343,10 @@ def run_ticker_data():
                  low_price, quote_volume, trade_count, bid_price, ask_price, date)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, rows)
-
-        conn.commit()
-        print(f"✔ crypto_24market_data inserted successfully ({len(rows)} rows)")
+            conn.commit()
+            print(f"✔ crypto_24market_data inserted successfully ({len(rows)} rows)")
+        else:
+            print("⚠ crypto_24market_data: no rows to insert")
     finally:
         if cursor is not None:
             cursor.close()
@@ -420,7 +356,7 @@ def run_ticker_data():
 
 def run_step(step_name, step_function):
     try:
-        print(f"Running {step_name}...")
+        print(f"\n--- Running {step_name} ---")
         step_function()
         return True
     except Exception as exc:
@@ -430,20 +366,23 @@ def run_step(step_name, step_function):
 
 def main():
     print("Starting pipeline...")
-    setup_tables()
+    setup_tables()       # raises if DB unreachable — stops everything
     cleanup_old_data()
 
     results = [
-        run_step("crypto_data", run_crypto_data),
-        run_step("orderbook", run_order_book),
-        run_step("derivatives_data", run_derivatives_data),
+        run_step("crypto_data",        run_crypto_data),
+        run_step("orderbook",          run_order_book),
+        run_step("derivatives_data",   run_derivatives_data),
         run_step("crypto_24market_data", run_ticker_data),
     ]
 
     if all(results):
-        print("✔ Pipeline completed successfully.")
+        print("\n✔ Pipeline completed successfully.")
     else:
-        print("⚠ Pipeline completed with one or more failed stages.")
+        failed = [["crypto_data","orderbook","derivatives_data","crypto_24market_data"][i]
+                  for i, r in enumerate(results) if not r]
+        print(f"\n⚠ Pipeline completed with failures: {failed}")
+        exit(1)  # makes GitHub Actions mark the run as failed
 
 
 if __name__ == "__main__":
