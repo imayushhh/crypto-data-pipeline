@@ -244,7 +244,7 @@ def run_derivatives_data():
         "XRP": "XRP-USDT-SWAP", "Dogecoin": "DOGE-USDT-SWAP",
         "Cardano": "ADA-USDT-SWAP", "Avalanche": "AVAX-USDT-SWAP",
         "Toncoin": "TON-USDT-SWAP", "Polkadot": "DOT-USDT-SWAP",
-        "Polygon": "MATIC-USDT-SWAP", "Litecoin": "LTC-USDT-SWAP",
+        "Polygon": "POL-USDT-SWAP", "Litecoin": "LTC-USDT-SWAP",
         "Chainlink": "LINK-USDT-SWAP", "TRON": "TRX-USDT-SWAP",
         "Cosmos": "ATOM-USDT-SWAP", "NEAR Protocol": "NEAR-USDT-SWAP",
         "Stellar": "XLM-USDT-SWAP", "Filecoin": "FIL-USDT-SWAP",
