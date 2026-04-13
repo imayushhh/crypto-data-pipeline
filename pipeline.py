@@ -3,9 +3,35 @@ from datetime import datetime
 
 DB_URL = os.environ["DATABASE_URL"]
 
-# Binance blocks GitHub Actions IPs — using api.binance.vision (Binance's own CDN mirror)
-# and a browser User-Agent as a fallback to avoid IP blocking
+# Use reachable Binance hosts with fallback so GitHub Actions does not depend on a single mirror.
 BINANCE_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+BINANCE_SPOT_BASE_URLS = [
+    "https://api.binance.com",
+    "https://data-api.binance.vision",
+    "https://api.binance.vision",
+]
+BINANCE_FUTURES_BASE_URLS = [
+    "https://fapi.binance.com",
+]
+
+
+def fetch_json_with_fallback(base_urls, path, label, headers=None, timeout=30):
+    last_error = None
+
+    for base_url in base_urls:
+        url = f"{base_url}{path}"
+        try:
+            response = requests.get(url, timeout=timeout, headers=headers)
+            if response.status_code == 200:
+                return response.json(), url
+
+            last_error = f"HTTP {response.status_code}"
+            print(f"{label}: failed from {url} ({response.status_code})")
+        except requests.RequestException as exc:
+            last_error = str(exc)
+            print(f"{label}: error from {url}: {exc}")
+
+    raise RuntimeError(f"{label} failed from all Binance hosts ({last_error})")
 
 
 def setup_tables():
@@ -187,13 +213,13 @@ def run_order_book():
 
     for coin_name, symbol in coins.items():
         try:
-            url = f"https://api.binance.vision/api/v3/depth?symbol={symbol}&limit=5"
-            response = requests.get(url, timeout=30, headers=BINANCE_HEADERS)
-            if response.status_code != 200:
-                print(f"Error fetching orderbook {coin_name}: {response.status_code}")
-                continue
-
-            order_book = response.json()
+            order_book, used_url = fetch_json_with_fallback(
+                BINANCE_SPOT_BASE_URLS,
+                f"/api/v3/depth?symbol={symbol}&limit=5",
+                f"orderbook {coin_name}",
+                headers=BINANCE_HEADERS,
+            )
+            print(f"Orderbook source for {coin_name}: {used_url}")
             bids = order_book.get("bids", [])
             asks = order_book.get("asks", [])
 
@@ -247,23 +273,24 @@ def run_derivatives_data():
     rows = []
 
     for coin_name, symbol in coins.items():
-        url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}"
         try:
-            response = requests.get(url, timeout=30, headers=BINANCE_HEADERS)
-            if response.status_code == 200:
-                d = response.json()
-                # FIX: Binance returns all values as strings — must cast to float
-                rows.append((
-                    coin_name,
-                    float(d.get("markPrice") or 0),
-                    float(d.get("estimatedSettlePrice") or 0),
-                    float(d.get("indexPrice") or 0),
-                    float(d.get("lastFundingRate") or 0),
-                    float(d.get("interestRate") or 0),
-                    datetime.now(),
-                ))
-            else:
-                print(f"Failed to fetch derivatives {coin_name} ({symbol}) - Status {response.status_code}")
+            d, used_url = fetch_json_with_fallback(
+                BINANCE_FUTURES_BASE_URLS,
+                f"/fapi/v1/premiumIndex?symbol={symbol}",
+                f"derivatives {coin_name}",
+                headers=BINANCE_HEADERS,
+            )
+            print(f"Derivatives source for {coin_name}: {used_url}")
+            # Binance returns all values as strings — cast explicitly.
+            rows.append((
+                coin_name,
+                float(d.get("markPrice") or 0),
+                float(d.get("estimatedSettlePrice") or 0),
+                float(d.get("indexPrice") or 0),
+                float(d.get("lastFundingRate") or 0),
+                float(d.get("interestRate") or 0),
+                datetime.now(),
+            ))
         except Exception as e:
             print(f"Exception fetching derivatives {coin_name}: {e}")
 
@@ -305,29 +332,30 @@ def run_ticker_data():
     rows = []
 
     for coin_name, symbol in coins.items():
-        url = f"https://api.binance.vision/api/v3/ticker/24hr?symbol={symbol}"
         try:
-            response = requests.get(url, timeout=30, headers=BINANCE_HEADERS)
-            if response.status_code == 200:
-                d = response.json()
-                # FIX: Binance returns price values as strings — cast explicitly
-                rows.append((
-                    coin_name,
-                    str(d.get("symbol", symbol)),
-                    float(d.get("priceChangePercent") or 0),
-                    float(d.get("lastPrice") or 0),
-                    float(d.get("volume") or 0),
-                    float(d.get("openPrice") or 0),
-                    float(d.get("highPrice") or 0),
-                    float(d.get("lowPrice") or 0),
-                    float(d.get("quoteVolume") or 0),
-                    int(d.get("count") or 0),
-                    float(d.get("bidPrice") or 0),
-                    float(d.get("askPrice") or 0),
-                    pd.Timestamp.now().date(),
-                ))
-            else:
-                print(f"Error fetching ticker {symbol}: {response.status_code}")
+            d, used_url = fetch_json_with_fallback(
+                BINANCE_SPOT_BASE_URLS,
+                f"/api/v3/ticker/24hr?symbol={symbol}",
+                f"ticker {coin_name}",
+                headers=BINANCE_HEADERS,
+            )
+            print(f"Ticker source for {coin_name}: {used_url}")
+            # Binance returns price values as strings — cast explicitly.
+            rows.append((
+                coin_name,
+                str(d.get("symbol", symbol)),
+                float(d.get("priceChangePercent") or 0),
+                float(d.get("lastPrice") or 0),
+                float(d.get("volume") or 0),
+                float(d.get("openPrice") or 0),
+                float(d.get("highPrice") or 0),
+                float(d.get("lowPrice") or 0),
+                float(d.get("quoteVolume") or 0),
+                int(d.get("count") or 0),
+                float(d.get("bidPrice") or 0),
+                float(d.get("askPrice") or 0),
+                pd.Timestamp.now().date(),
+            ))
         except Exception as e:
             print(f"Exception fetching ticker {coin_name}: {e}")
 
