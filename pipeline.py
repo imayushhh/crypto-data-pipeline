@@ -3,9 +3,33 @@ from datetime import datetime
 
 DB_URL = os.environ["DATABASE_URL"]
 
-# Binance blocks GitHub Actions IPs — using api.binance.vision (Binance's own CDN mirror)
-# and a browser User-Agent as a fallback to avoid IP blocking
-BINANCE_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+# Ordered list of hosts to try — first one that responds 200 wins
+SPOT_HOSTS = [
+    "https://data-api.binance.vision",  # worked in GitHub Actions previously
+    "https://api.binance.us",           # US mirror, usually not geo-blocked
+    "https://api.binance.com",          # main, may be blocked
+]
+
+DERIVATIVES_HOSTS = [
+    "https://api.bybit.com",            # Bybit linear tickers
+    "https://api-testnet.bybit.com",    # Bybit testnet fallback
+]
+
+
+def get(hosts, path, label):
+    """Try each host in order, return (json, url) for first 200 response."""
+    for host in hosts:
+        url = f"{host}{path}"
+        try:
+            r = requests.get(url, timeout=30, headers=HEADERS)
+            if r.status_code == 200:
+                return r.json(), url
+            print(f"  {label}: {url} → {r.status_code}")
+        except Exception as e:
+            print(f"  {label}: {url} → {e}")
+    return None, None
 
 
 def setup_tables():
@@ -118,7 +142,7 @@ def run_crypto_data():
     cursor = None
     try:
         url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&sparkline=false"
-        response = requests.get(url, timeout=30)
+        response = requests.get(url, timeout=30, headers=HEADERS)
         response.raise_for_status()
         data = response.json()
 
@@ -139,16 +163,9 @@ def run_crypto_data():
                 total_supply = None
             else:
                 total_supply = float(raw_ts)
-
             rows.append((
-                row[0],
-                float(row[1]),
-                float(row[2]),
-                float(row[3]),
-                float(row[4]),
-                float(row[5]),
-                total_supply,
-                row[7],
+                row[0], float(row[1]), float(row[2]), float(row[3]),
+                float(row[4]), float(row[5]), total_supply, row[7],
             ))
 
         conn = psycopg2.connect(DB_URL)
@@ -183,32 +200,21 @@ def run_order_book():
     }
 
     rows = []
-
     for coin_name, symbol in coins.items():
-        try:
-            url = f"https://api.binance.vision/api/v3/depth?symbol={symbol}&limit=5"
-            response = requests.get(url, timeout=30, headers=BINANCE_HEADERS)
-            if response.status_code != 200:
-                print(f"Error fetching orderbook {coin_name}: {response.status_code}")
-                continue
-
-            order_book = response.json()
-            bids = order_book.get("bids", [])
-            asks = order_book.get("asks", [])
-
-            for i in range(min(len(bids), len(asks), 5)):
-                rows.append((
-                    coin_name,
-                    i + 1,
-                    float(bids[i][0]),
-                    float(bids[i][1]),
-                    float(asks[i][0]),
-                    float(asks[i][1]),
-                    pd.Timestamp.now().date(),
-                ))
-        except Exception as e:
-            print(f"Exception for orderbook {coin_name}: {e}")
+        data, used_url = get(SPOT_HOSTS, f"/api/v3/depth?symbol={symbol}&limit=5", coin_name)
+        if data is None:
+            print(f"  orderbook {coin_name}: all hosts failed, skipping")
             continue
+        print(f"  orderbook {coin_name}: OK via {used_url}")
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+        for i in range(min(len(bids), len(asks), 5)):
+            rows.append((
+                coin_name, i + 1,
+                float(bids[i][0]), float(bids[i][1]),
+                float(asks[i][0]), float(asks[i][1]),
+                pd.Timestamp.now().date(),
+            ))
 
     conn = None
     cursor = None
@@ -233,9 +239,6 @@ def run_order_book():
 
 
 def run_derivatives_data():
-    # Switched from Binance fapi (geo-blocked in Canada, HTTP 451)
-    # to Bybit public API — no geo restrictions, no API key needed
-    # One single API call returns all tickers — faster than per-coin loop
     symbol_to_name = {
         "BTCUSDT": "Bitcoin", "ETHUSDT": "Ethereum", "BNBUSDT": "Binance Coin",
         "SOLUSDT": "Solana", "XRPUSDT": "XRP", "DOGEUSDT": "Dogecoin",
@@ -247,12 +250,10 @@ def run_derivatives_data():
     }
 
     rows = []
-    try:
-        url = "https://api.bybit.com/v5/market/tickers?category=linear"
-        response = requests.get(url, timeout=30, headers=BINANCE_HEADERS)
-        response.raise_for_status()
-        tickers = response.json().get("result", {}).get("list", [])
-
+    data, used_url = get(DERIVATIVES_HOSTS, "/v5/market/tickers?category=linear", "derivatives")
+    if data is not None:
+        print(f"  derivatives: OK via {used_url}")
+        tickers = data.get("result", {}).get("list", [])
         for t in tickers:
             symbol = t.get("symbol")
             if symbol not in symbol_to_name:
@@ -260,14 +261,14 @@ def run_derivatives_data():
             rows.append((
                 symbol_to_name[symbol],
                 float(t.get("markPrice") or 0),
-                float(t.get("prevPrice24h") or 0),  # closest to estimatedSettlePrice
+                float(t.get("prevPrice24h") or 0),
                 float(t.get("indexPrice") or 0),
                 float(t.get("fundingRate") or 0),
-                0.0003,                              # Bybit fixed interest rate
+                0.0003,
                 datetime.now(),
             ))
-    except Exception as e:
-        print(f"Exception fetching derivatives from Bybit: {e}")
+    else:
+        print("  derivatives: all hosts failed")
 
     conn = None
     cursor = None
@@ -303,32 +304,27 @@ def run_ticker_data():
     }
 
     rows = []
-
     for coin_name, symbol in coins.items():
-        url = f"https://api.binance.vision/api/v3/ticker/24hr?symbol={symbol}"
-        try:
-            response = requests.get(url, timeout=30, headers=BINANCE_HEADERS)
-            if response.status_code == 200:
-                d = response.json()
-                rows.append((
-                    coin_name,
-                    str(d.get("symbol", symbol)),
-                    float(d.get("priceChangePercent") or 0),
-                    float(d.get("lastPrice") or 0),
-                    float(d.get("volume") or 0),
-                    float(d.get("openPrice") or 0),
-                    float(d.get("highPrice") or 0),
-                    float(d.get("lowPrice") or 0),
-                    float(d.get("quoteVolume") or 0),
-                    int(d.get("count") or 0),
-                    float(d.get("bidPrice") or 0),
-                    float(d.get("askPrice") or 0),
-                    pd.Timestamp.now().date(),
-                ))
-            else:
-                print(f"Error fetching ticker {symbol}: {response.status_code}")
-        except Exception as e:
-            print(f"Exception fetching ticker {coin_name}: {e}")
+        d, used_url = get(SPOT_HOSTS, f"/api/v3/ticker/24hr?symbol={symbol}", coin_name)
+        if d is None:
+            print(f"  ticker {coin_name}: all hosts failed, skipping")
+            continue
+        print(f"  ticker {coin_name}: OK via {used_url}")
+        rows.append((
+            coin_name,
+            str(d.get("symbol", symbol)),
+            float(d.get("priceChangePercent") or 0),
+            float(d.get("lastPrice") or 0),
+            float(d.get("volume") or 0),
+            float(d.get("openPrice") or 0),
+            float(d.get("highPrice") or 0),
+            float(d.get("lowPrice") or 0),
+            float(d.get("quoteVolume") or 0),
+            int(d.get("count") or 0),
+            float(d.get("bidPrice") or 0),
+            float(d.get("askPrice") or 0),
+            pd.Timestamp.now().date(),
+        ))
 
     conn = None
     cursor = None
