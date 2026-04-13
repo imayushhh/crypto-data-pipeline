@@ -12,10 +12,7 @@ SPOT_HOSTS = [
     "https://api.binance.com",          # main, may be blocked
 ]
 
-DERIVATIVES_HOSTS = [
-    "https://api.bybit.com",            # Bybit linear tickers
-    "https://api-testnet.bybit.com",    # Bybit testnet fallback
-]
+# OKX is used for derivatives — no geo-blocking on GitHub Actions
 
 
 def get(hosts, path, label):
@@ -239,36 +236,61 @@ def run_order_book():
 
 
 def run_derivatives_data():
-    symbol_to_name = {
-        "BTCUSDT": "Bitcoin", "ETHUSDT": "Ethereum", "BNBUSDT": "Binance Coin",
-        "SOLUSDT": "Solana", "XRPUSDT": "XRP", "DOGEUSDT": "Dogecoin",
-        "ADAUSDT": "Cardano", "AVAXUSDT": "Avalanche", "TONUSDT": "Toncoin",
-        "DOTUSDT": "Polkadot", "MATICUSDT": "Polygon", "LTCUSDT": "Litecoin",
-        "LINKUSDT": "Chainlink", "TRXUSDT": "TRON", "ATOMUSDT": "Cosmos",
-        "NEARUSDT": "NEAR Protocol", "XLMUSDT": "Stellar", "FILUSDT": "Filecoin",
-        "ALGOUSDT": "Algorand", "APEUSDT": "ApeCoin"
+    # Using OKX public API — no geo-blocking, no API key needed
+    # OKX instId format: BTC-USDT-SWAP (perpetual swap)
+    coin_to_instid = {
+        "Bitcoin": "BTC-USDT-SWAP", "Ethereum": "ETH-USDT-SWAP",
+        "Binance Coin": "BNB-USDT-SWAP", "Solana": "SOL-USDT-SWAP",
+        "XRP": "XRP-USDT-SWAP", "Dogecoin": "DOGE-USDT-SWAP",
+        "Cardano": "ADA-USDT-SWAP", "Avalanche": "AVAX-USDT-SWAP",
+        "Toncoin": "TON-USDT-SWAP", "Polkadot": "DOT-USDT-SWAP",
+        "Polygon": "MATIC-USDT-SWAP", "Litecoin": "LTC-USDT-SWAP",
+        "Chainlink": "LINK-USDT-SWAP", "TRON": "TRX-USDT-SWAP",
+        "Cosmos": "ATOM-USDT-SWAP", "NEAR Protocol": "NEAR-USDT-SWAP",
+        "Stellar": "XLM-USDT-SWAP", "Filecoin": "FIL-USDT-SWAP",
+        "Algorand": "ALGO-USDT-SWAP", "ApeCoin": "APE-USDT-SWAP"
     }
 
     rows = []
-    data, used_url = get(DERIVATIVES_HOSTS, "/v5/market/tickers?category=linear", "derivatives")
-    if data is not None:
-        print(f"  derivatives: OK via {used_url}")
-        tickers = data.get("result", {}).get("list", [])
-        for t in tickers:
-            symbol = t.get("symbol")
-            if symbol not in symbol_to_name:
+    for coin_name, instId in coin_to_instid.items():
+        try:
+            url = f"https://www.okx.com/api/v5/public/mark-price?instType=SWAP&instId={instId}"
+            r1 = requests.get(url, timeout=30, headers=HEADERS)
+
+            url2 = f"https://www.okx.com/api/v5/public/funding-rate?instId={instId}"
+            r2 = requests.get(url2, timeout=30, headers=HEADERS)
+
+            url3 = f"https://www.okx.com/api/v5/market/ticker?instId={instId}"
+            r3 = requests.get(url3, timeout=30, headers=HEADERS)
+
+            if r1.status_code != 200 or r2.status_code != 200 or r3.status_code != 200:
+                print(f"  derivatives {coin_name}: OKX status {r1.status_code}/{r2.status_code}/{r3.status_code}")
                 continue
+
+            mark_data = r1.json().get("data", [{}])[0]
+            fund_data = r2.json().get("data", [{}])[0]
+            tick_data = r3.json().get("data", [{}])[0]
+
+            mark_price = float(mark_data.get("markPx") or 0)
+            index_price = float(mark_data.get("idxPx") or mark_price)
+            funding_rate = float(fund_data.get("fundingRate") or 0)
+            interest_rate = float(fund_data.get("nextFundingRate") or 0)
+            estimated_settle_price = float(tick_data.get("open24h") or mark_price)
+
             rows.append((
-                symbol_to_name[symbol],
-                float(t.get("markPrice") or 0),
-                float(t.get("prevPrice24h") or 0),
-                float(t.get("indexPrice") or 0),
-                float(t.get("fundingRate") or 0),
-                0.0003,
+                coin_name,
+                mark_price,
+                estimated_settle_price,
+                index_price,
+                funding_rate,
+                interest_rate,
                 datetime.now(),
             ))
-    else:
-        print("  derivatives: all hosts failed")
+            print(f"  derivatives {coin_name}: OK via OKX")
+
+        except Exception as e:
+            print(f"  derivatives {coin_name}: {e}")
+        time.sleep(0.1)
 
     conn = None
     cursor = None
